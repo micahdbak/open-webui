@@ -56,6 +56,7 @@
 	import Folders from './Sidebar/Folders.svelte';
 	import { getChannels, createNewChannel } from '$lib/apis/channels';
 	import ChannelModal from './Sidebar/ChannelModal.svelte';
+	import CallModal from './Sidebar/CallModal.svelte';
 	import ChannelItem from './Sidebar/ChannelItem.svelte';
 	import PencilSquare from '../icons/PencilSquare.svelte';
 	import Search from '../icons/Search.svelte';
@@ -76,6 +77,7 @@
 
 	let selectedChatId = null;
 	let showCreateChannel = false;
+	let showStartCall = false;
 
 	// Pagination variables
 	let chatListLoading = false;
@@ -87,6 +89,7 @@
 
 	let showPinnedModels = false;
 	let showChannels = false;
+	let showCalls = false;
 	let showFolders = false;
 
 	let folders = {};
@@ -634,6 +637,35 @@
 	}}
 />
 
+<CallModal
+	bind:show={showStartCall}
+	onSubmit={async (payload: any) => {
+		let { is_private, user_ids } = payload ?? {};
+
+		if (!user_ids || user_ids.length === 0) {
+			toast.error($i18n.t('Please select at least one user for a call.'));
+			return;
+		}
+
+		const res = {};
+		//const res = await createNewCall(localStorage.token, {
+		//	is_private: is_private,
+		//	user_ids: user_ids
+		//}).catch((error) => {
+		//	toast.error(`${error}`);
+		//	return null;
+		//});
+
+		if (res) {
+			//$socket.emit('join-channels', { auth: { token: $user?.token } });
+			//await initChannels();
+			showStartCall = false;
+			showCalls = true;
+			//goto(`/calls/${res.id}`);
+		}
+	}}
+/>
+
 <FolderModal
 	bind:show={showCreateFolderModal}
 	onSubmit={async (folder) => {
@@ -1096,6 +1128,29 @@
 								/>
 							{/if}
 						{/each}
+					</Folder>
+				{/if}
+
+				{#if $config?.features?.enable_calls && ($user?.role === 'admin' || ($user?.permissions?.features?.calls ?? true))}
+					<Folder
+						id="sidebar-calls"
+						bind:open={showCalls}
+						className="px-2 mt-0.5"
+						name={$i18n.t('Calls')}
+						chevron={false}
+						dragAndDrop={false}
+						onAdd={$user?.role === 'admin' || ($user?.permissions?.features?.calls ?? true)
+							? async () => {
+									await tick();
+
+									setTimeout(() => {
+										showStartCall = true;
+									}, 0);
+								}
+							: null}
+						onAddLabel={$i18n.t('Start Call')}
+					>
+						<!---->
 					</Folder>
 				{/if}
 

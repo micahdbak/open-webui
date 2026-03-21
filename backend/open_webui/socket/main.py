@@ -9,6 +9,8 @@ from typing import Dict, Set
 from redis import asyncio as aioredis
 import pycrdt as Y
 
+import json
+
 from open_webui.models.users import Users, UserNameResponse
 from open_webui.models.channels import Channels
 from open_webui.models.chats import Chats
@@ -160,6 +162,9 @@ else:
 
     aquire_func = release_func = renew_func = lambda: True
     session_aquire_func = session_release_func = session_renew_func = lambda: True
+
+
+
 
 
 YDOC_MANAGER = YdocManager(
@@ -502,6 +507,49 @@ def normalize_document_id(document_id: str) -> str:
     return document_id
 
 
+@sio.on('events:call')
+async def call_events(sid, data):
+    """P2P mesh signaling relay — forwards offers/answers/candidates between peers."""
+    try:
+        channel_id = data.get('channel_id')
+        signal_type = data.get('type', '')
+        room = f'call:{channel_id}'
+
+        log.info(f'call:signal {sid} sent {signal_type} for channel {channel_id}')
+
+        if signal_type == 'join':
+            # notify existing peers that a new peer has joined
+            await sio.emit(
+                'events:call',
+                {'channel_id': channel_id, 'type': 'peer-joined', 'peer_id': sid},
+                room=room,
+            )
+            # add the new peer to the room
+            await sio.enter_room(sid, room)
+
+        elif signal_type in ('offer', 'answer', 'candidate'):
+            # forward to the target peer
+            to = data.get('to')
+            if to:
+                await sio.emit(
+                    'events:call',
+                    {**data, 'from': sid},
+                    to=to,
+                )
+
+        elif signal_type == 'leave':
+            await sio.leave_room(sid, room)
+            await sio.emit(
+                'events:call',
+                {'channel_id': channel_id, 'type': 'peer-left', 'peer_id': sid},
+                room=room,
+            )
+        else:
+            log.warning(f"call:signal unknown type '{signal_type}' from {sid}")
+    except Exception as e:
+        log.error(f'call:error in call_events from {sid}: {e}', exc_info=True)
+
+
 @sio.on('ydoc:document:join')
 async def ydoc_document_join(sid, data):
     """Handle user joining a document"""
@@ -773,9 +821,18 @@ async def disconnect(sid):
                     USAGE_POOL[model_id] = connections
 
         await YDOC_MANAGER.remove_user_from_all_documents(sid)
-    else:
-        pass
-        # print(f"Unknown session ID {sid} disconnected")
+
+    # notify call peers that this session disconnected
+    for room in sio.rooms(sid):
+        if room.startswith('call:'):
+            channel_id = room[5:]  # strip 'call:' prefix
+            log.info(f'call:disconnect {sid} leaving call {channel_id}')
+            await sio.leave_room(sid, room)
+            await sio.emit(
+                'events:call',
+                {'channel_id': channel_id, 'type': 'peer-left', 'peer_id': sid},
+                room=room,
+            )
 
 
 def get_event_emitter(request_info, update_db=True):

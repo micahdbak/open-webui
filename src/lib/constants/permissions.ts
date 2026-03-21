@@ -55,6 +55,7 @@ export const DEFAULT_PERMISSIONS = {
 		api_keys: false,
 		notes: true,
 		channels: true,
+		calls: true,
 		folders: true,
 		direct_tool_servers: false,
 		web_search: true,
