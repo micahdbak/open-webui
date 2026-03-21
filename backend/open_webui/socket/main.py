@@ -8,6 +8,8 @@ import time
 from typing import Dict, Set
 from redis import asyncio as aioredis
 import pycrdt as Y
+import aiortc
+import json
 
 from open_webui.models.users import Users, UserNameResponse
 from open_webui.models.channels import Channels
@@ -40,7 +42,7 @@ from open_webui.env import (
     WEBSOCKET_EVENT_CALLER_TIMEOUT,
 )
 from open_webui.utils.auth import decode_token
-from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
+from open_webui.socket.utils import RedisDict, RedisLock, YdocManager, SingleForwardingUnit
 from open_webui.tasks import create_task, stop_item_tasks
 from open_webui.utils.redis import get_redis_connection
 from open_webui.utils.access_control import has_permission
@@ -162,6 +164,9 @@ else:
 
     aquire_func = release_func = renew_func = lambda: True
     session_aquire_func = session_release_func = session_renew_func = lambda: True
+
+
+SFU_POOL = {}
 
 
 YDOC_MANAGER = YdocManager(
@@ -491,6 +496,89 @@ async def channel_events(sid, data):
         Channels.update_member_last_read_at(data['channel_id'], user['id'])
 
 
+def get_sfu_for_channel(channel_id):
+    sfu = SFU_POOL.get(channel_id)
+    if sfu is None:
+        log.info(f'call:sfu creating new SFU for channel {channel_id}')
+        sfu = SingleForwardingUnit(channel_id)
+
+        @sfu.on('renegotiate')
+        async def handle_renegotiation_request(to_sid, data):
+            log.info(f'call:sfu emitting renegotiation request to {to_sid}')
+            await sio.emit('channel:call:renegotiate', {'channel_id': channel_id, 'data': data}, to=to_sid)
+
+        SFU_POOL[channel_id] = sfu
+
+    return sfu
+
+
+@sio.on('channel:call:offer')
+async def channel_call_peer_offer(sid, data):
+    try:
+        user = SESSION_POOL.get(sid)
+        if not user:
+            return
+
+        if user.get('role') != 'admin' and not has_permission(user['id'], 'features.channels'):
+            return
+
+        channel_id = data['channel_id']
+
+        # verify user is a member of this channel's room
+        room = f'channel:{channel_id}'
+        participants = sio.manager.get_participants(namespace='/', room=room)
+        if sid not in [s for s, _ in participants]:
+            return
+
+        sfu = get_sfu_for_channel(channel_id)
+
+        signal_data = data.get('data', {})
+        if not signal_data:
+            return
+
+        answer = await sfu.handle_offer(sid, signal_data.get('sdp'), signal_data.get('type'))
+
+        log.info(f'call:signal sending answer to {sid}')
+        await sio.emit(
+            'channel:call:answer',
+            {'channel_id': channel_id, 'data': {'sdp': answer.sdp, 'type': answer.type}},
+            to=sid,
+        )
+    except Exception as e:
+        log.error(f'call:error in call_offer from {sid}: {e}', exc_info=True)
+
+
+@sio.on('channel:call:leave')
+async def channel_call_peer_leave(sid, data):
+    try:
+        user = SESSION_POOL.get(sid)
+        if not user:
+            return
+
+        channel_id = data['channel_id']
+        sfu = SFU_POOL.get(channel_id)
+        if not sfu:
+            return
+
+        log.info(f'call:signal {sid} leaving channel {channel_id}')
+        await sfu.remove_peer(sid)
+
+        # notify remaining peers
+        for peer_sid in list(sfu.peers.keys()):
+            await sio.emit(
+                'channel:call:peer-left',
+                {'channel_id': channel_id, 'data': {'peer_id': sid}},
+                to=peer_sid,
+            )
+
+        # clean up empty SFU
+        if sfu.is_empty():
+            log.info(f'call:sfu removing empty SFU for channel {channel_id}')
+            del SFU_POOL[channel_id]
+    except Exception as e:
+        log.error(f'call:error in call_leave from {sid}: {e}', exc_info=True)
+
+
 def normalize_document_id(document_id: str) -> str:
     """Canonicalize document IDs to prevent auth bypass via prefix variants.
 
@@ -778,6 +866,25 @@ async def disconnect(sid):
     else:
         pass
         # print(f"Unknown session ID {sid} disconnected")
+
+    # clean up any SFU connections for this session
+    for channel_id in list(SFU_POOL.keys()):
+        # TODO refine this with [redis] cache of what channel the user is in
+        sfu = SFU_POOL.get(channel_id)
+        if sfu and (sid in sfu.peers):
+            log.info(f'call:disconnect removing {sid} from SFU {channel_id}')
+            await sfu.remove_peer(sid)
+
+            for peer_sid in list(sfu.peers.keys()):
+                await sio.emit(
+                    'channel:call:peer-left',
+                    {'channel_id': channel_id, 'data': {'peer_id': sid}},
+                    to=peer_sid,
+                )
+
+            if sfu.is_empty():
+                log.info(f'call:disconnect removing empty SFU for channel {channel_id}')
+                del SFU_POOL[channel_id]
 
 
 def get_event_emitter(request_info, update_db=True):

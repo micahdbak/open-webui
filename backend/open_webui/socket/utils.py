@@ -1,9 +1,16 @@
 import json
 import uuid
+import logging
 from open_webui.utils.redis import get_redis_connection
 from open_webui.env import REDIS_KEY_PREFIX
-from typing import Optional, List, Tuple
+from typing import List
+from pyee.asyncio import AsyncIOEventEmitter
 import pycrdt as Y
+import asyncio
+import aiortc
+from aiortc.contrib.media import MediaRelay
+
+log = logging.getLogger(__name__)
 
 
 class RedisLock:
@@ -261,3 +268,167 @@ class YdocManager:
                 del self._updates[document_id]
             if document_id in self._users:
                 del self._users[document_id]
+
+
+class SingleForwardingUnit(AsyncIOEventEmitter):
+    def __init__(self, channel_id):
+        super().__init__()
+
+        self.channel_id = channel_id
+
+        self.peers = {}
+        self.peer_tracks = {}
+
+        self.pending_renegotiation_tracks = {}
+        self.inflight_renegotiation_tracks = {}
+        self.renegotiate_tracks_tasks = {}
+
+        self.media_relay = MediaRelay()
+
+    async def _on_new_track_from_sid(self, from_sid, new_track):
+        log.info(f'sfu:_on_new_track_from_sid received {new_track.kind} track from {from_sid}')
+
+        # add track to sid's current tracks
+        from_sid_current_tracks = self.peer_tracks.setdefault(from_sid, [])
+        from_sid_current_tracks.append(new_track)
+
+        # iterate over all peers and consider this track for renegotiation
+        for relay_sid in list(self.peers.keys()):
+            # don't relay this track to the sender
+            if from_sid == relay_sid:
+                continue
+
+            relay_pc = self.peers[relay_sid]
+            if relay_pc.connectionState == 'closed':
+                continue
+
+            pending_tracks = self.pending_renegotiation_tracks.setdefault(relay_sid, [])
+            pending_tracks.append({'peer_id': from_sid, 'track': new_track})
+
+            # emit the renegotiation task once even if n tracks come in quick succession
+            # i.e., emit 100ms after receiving a track; if another comes in, cancel and reschedule
+            existing_renegotiation_task = self.renegotiate_tracks_tasks.pop(relay_sid, None)
+            if existing_renegotiation_task is not None:
+                existing_renegotiation_task.cancel()
+
+            self.renegotiate_tracks_tasks[relay_sid] = asyncio.create_task(self._renegotiate_tracks_for_sid(relay_sid))
+
+    async def _renegotiate_tracks_for_sid(self, sid):
+        await asyncio.sleep(0.1)
+
+        pc = self.peers.get(sid)
+        if not pc:
+            log.info(f'sfu:renegotiate no pc for {sid}, skipping')
+            return
+
+        # if signaling state is not stable, then a previous negotiation is in process;
+        # wait until it is complete before starting a new renegotiation
+        while pc.signalingState != 'stable':
+            log.info(f'sfu:renegotiate waiting for stable state for {sid} (current: {pc.signalingState})')
+
+            await asyncio.sleep(0.1)
+
+            if sid not in self.peers or pc.signalingState == 'closed':
+                return
+
+        pending_tracks = self.pending_renegotiation_tracks.pop(sid, [])
+        if not pending_tracks:
+            return
+
+        # move the tracks from pending to inflight, as the client must generate an offer with transceivers;
+        # should new tracks be added between this renegotiate event and an answer, we should only add the inflight tracks
+        self.inflight_renegotiation_tracks[sid] = pending_tracks
+
+        data = [{'peer_id': row.get('peer_id'), 'kind': row.get('track').kind} for row in pending_tracks]
+
+        self.emit('renegotiate', sid, data)
+
+    async def handle_offer(self, offering_sid, sdp, sdp_type):
+        log.info(f'sfu:on_offer from {offering_sid}')
+        offer = aiortc.RTCSessionDescription(sdp, sdp_type)
+
+        # existing connection: track renegotiation
+        pc = self.peers.get(offering_sid)
+        if pc is not None:
+            await pc.setRemoteDescription(offer)
+
+            inflight_peer_tracks = self.inflight_renegotiation_tracks.pop(offering_sid, [])
+            new_tracks = [row.get('track') for row in inflight_peer_tracks]
+
+            if new_tracks:
+                all_transceivers = pc.getTransceivers()
+
+                # client has prepared sendonly transceivers for relaying
+                target_transceivers = all_transceivers[-len(new_tracks) :]
+
+                for i, track in enumerate(new_tracks):
+                    relay = self.media_relay.subscribe(track, buffered=False)
+                    if i < len(target_transceivers):
+                        target_transceivers[i].direction = 'sendonly'
+                        target_transceivers[i]._offerDirection = 'sendonly'
+                        target_transceivers[i].sender.replaceTrack(relay)
+                    else:
+                        log.warning(f'sfu:on_offer no target transceiver for relay track {i} to {offering_sid}')
+
+                log.info(f'sfu:on_offer added {len(new_tracks)} relay tracks for existing peer {offering_sid}')
+
+            # return answer to renegotiation offer
+            await pc.setLocalDescription(await pc.createAnswer())
+            return pc.localDescription
+
+        # new connection
+
+        # TODO: custom STUN/TURN servers configurable in admin settings
+        pc = aiortc.RTCPeerConnection()
+        self.peers[offering_sid] = pc
+
+        @pc.on('track')
+        async def on_track(track):
+            await self._on_new_track_from_sid(offering_sid, track)
+
+        # complete the initial handshake without the other peers' tracks
+        await pc.setRemoteDescription(offer)
+        await pc.setLocalDescription(await pc.createAnswer())
+        log.info(f'sfu:on_offer created answer for {offering_sid}')
+
+        # prepare other peers' tracks for renegotiation
+        for existing_sid in self.peer_tracks:
+            if offering_sid == existing_sid:
+                continue
+
+            existing_sid_tracks = self.peer_tracks.get(existing_sid, [])
+            negotiate_tracks = [{'peer_id': existing_sid, 'track': track} for track in existing_sid_tracks]
+
+            if existing_sid_tracks:
+                pending_tracks = self.pending_renegotiation_tracks.setdefault(offering_sid, [])
+                pending_tracks.extend(negotiate_tracks)
+
+        # if the above block generated pending tracks, schedule a renegotiation task
+        if self.pending_renegotiation_tracks.get(offering_sid):
+            log.info(
+                f'sfu:on_offer {len(self.pending_renegotiation_tracks[offering_sid])} relay tracks pending for {offering_sid}, requesting renegotiation'
+            )
+            self.renegotiate_tracks_tasks[offering_sid] = asyncio.create_task(
+                self._renegotiate_tracks_for_sid(offering_sid)
+            )
+
+        # return answer for offer
+        return pc.localDescription
+
+    async def remove_peer(self, sid):
+        log.info(f'sfu:remove_peer removing {sid} from channel {self.channel_id}')
+
+        existing_renegotiation_task = self.renegotiate_tracks_tasks.pop(sid, None)
+        if existing_renegotiation_task is not None:
+            existing_renegotiation_task.cancel()
+
+        existing_pc = self.peers.pop(sid, None)
+        if existing_pc is not None:
+            await existing_pc.close()
+
+        self.peer_tracks.pop(sid, None)
+        self.pending_renegotiation_tracks.pop(sid, None)
+        self.inflight_renegotiation_tracks.pop(sid, None)
+
+    def is_empty(self):
+        return len(self.peers) == 0
