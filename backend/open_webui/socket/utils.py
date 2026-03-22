@@ -1,9 +1,14 @@
 import json
 import uuid
+import logging
 from open_webui.utils.redis import get_redis_connection
 from open_webui.env import REDIS_KEY_PREFIX
-from typing import Optional, List, Tuple
+from typing import List
+from pyee.asyncio import AsyncIOEventEmitter
 import pycrdt as Y
+import asyncio
+
+log = logging.getLogger(__name__)
 
 
 class RedisLock:
@@ -252,3 +257,6 @@ class YdocManager:
                 del self._updates[document_id]
             if document_id in self._users:
                 del self._users[document_id]
+
+
+

@@ -150,6 +150,29 @@ def check_channels_access(request: Request, user: Optional[UserModel] = None):
 
 
 ############################
+# Calls Enabled Dependency
+############################
+
+
+def check_calls_access(request: Request, user: Optional[UserModel] = None):
+    """Dependency to ensure calls are globally enabled."""
+    if not request.app.state.config.ENABLE_CALLS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Calls are not enabled',
+        )
+
+    if user:
+        if user.role != 'admin' and not has_permission(
+            user.id, 'features.calls', request.app.state.config.USER_PERMISSIONS
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.UNAUTHORIZED,
+            )
+
+
+############################
 # GetChatList
 ############################
 

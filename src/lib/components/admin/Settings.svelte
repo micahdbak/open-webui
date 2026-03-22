@@ -91,7 +91,8 @@
 				'reverse proxy',
 				'webhook',
 				'community',
-				'channels'
+				'channels',
+				'calls'
 			]
 		},
 		{
