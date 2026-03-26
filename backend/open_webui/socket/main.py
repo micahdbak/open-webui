@@ -40,6 +40,7 @@ from open_webui.env import (
     WEBSOCKET_SERVER_LOGGING,
     WEBSOCKET_SERVER_ENGINEIO_LOGGING,
     WEBSOCKET_EVENT_CALLER_TIMEOUT,
+    INSTANCE_ID,
 )
 from open_webui.utils.auth import decode_token
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager, SingleForwardingUnit
@@ -167,6 +168,26 @@ else:
 
 
 SFU_POOL = {}
+
+if WEBSOCKET_MANAGER == 'redis':
+    # key is channel_id, value is {instance_id, created_at}
+    SFU_REGISTRY = RedisDict(
+        f'{REDIS_KEY_PREFIX}:sfu:registry',
+        redis_url=WEBSOCKET_REDIS_URL,
+        redis_sentinels=redis_sentinels,
+        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+    )
+
+    # key is sid, value is channel_id
+    SFU_SESSIONS = RedisDict(
+        f'{REDIS_KEY_PREFIX}:sfu:sessions',
+        redis_url=WEBSOCKET_REDIS_URL,
+        redis_sentinels=redis_sentinels,
+        redis_cluster=WEBSOCKET_REDIS_CLUSTER,
+    )
+else:
+    SFU_REGISTRY = {}
+    SFU_SESSIONS = {}
 
 
 YDOC_MANAGER = YdocManager(
@@ -512,6 +533,79 @@ def get_sfu_for_channel(channel_id):
     return sfu
 
 
+# process peer offer on SFU running on local instance
+async def channel_call_sfu_handle_offer(sid, data):
+    channel_id = data['channel_id']
+    signal_data = data['data']
+
+    log.info(f'call: processing offer for {sid} in channel {channel_id}')
+    sfu = get_sfu_for_channel(channel_id)
+    answer = await sfu.handle_offer(sid, signal_data.get('sdp'), signal_data.get('type'))
+
+    log.info(f'call: sending answer to {sid} in channel {channel_id}')
+    await sio.emit(
+        'channel:call:answer', {'channel_id': channel_id, 'data': {'sdp': answer.sdp, 'type': answer.type}}, to=sid
+    )
+
+
+# process peer leaving on SFU running on local instance
+async def channel_call_sfu_handle_leave(sid, data):
+    channel_id = data['channel_id']
+    sfu = SFU_POOL.get(channel_id)
+    if not sfu:
+        return
+
+    log.info(f'call: {sid} leaving channel {channel_id}')
+    await sfu.remove_peer(sid)
+
+    # notify remaining peers
+    for peer_sid in list(sfu.peers.keys()):
+        await sio.emit(
+            'channel:call:peer-left',
+            {'channel_id': channel_id, 'data': {'peer_id': sid}},
+            to=peer_sid,
+        )
+
+    if sfu.is_empty():
+        log.info(f'call: removing empty SFU for channel {channel_id}')
+        del SFU_POOL[channel_id]
+
+        # remove registry entry as the call has ended
+        if WEBSOCKET_MANAGER == 'redis' and channel_id in SFU_REGISTRY:
+            del SFU_REGISTRY[channel_id]
+
+
+# background task that receives relayed messages
+async def channel_call_message_relayer():
+    if WEBSOCKET_MANAGER != 'redis' or REDIS is None:
+        return
+
+    channel_name = f'{REDIS_KEY_PREFIX}:sfu:relay:{INSTANCE_ID}'
+    pubsub = REDIS.pubsub()
+    await pubsub.subscribe(channel_name)
+
+    try:
+        async for message in pubsub.listen():
+            if message['type'] != 'message':
+                continue
+
+            try:
+                payload = json.loads(message['data'])
+                event = payload['event']
+                sid = payload['sid']
+                data = payload['data']
+
+                if event == 'offer':
+                    await channel_call_sfu_handle_offer(sid, data)
+                elif event == 'leave':
+                    await channel_call_sfu_handle_leave(sid, data)
+            except Exception as e:
+                log.error(f'call: error processing relayed message: {e}', exc_info=True)
+    finally:
+        await pubsub.unsubscribe(channel_name)
+        await pubsub.close()
+
+
 @sio.on('channel:call:offer')
 async def channel_call_peer_offer(sid, data):
     try:
@@ -530,22 +624,35 @@ async def channel_call_peer_offer(sid, data):
         if sid not in [s for s, _ in participants]:
             return
 
-        sfu = get_sfu_for_channel(channel_id)
-
-        signal_data = data.get('data', {})
-        if not signal_data:
+        # check if user is in a different call
+        existing_channel_id = SFU_SESSIONS.get(sid)
+        if existing_channel_id and existing_channel_id != channel_id:
             return
 
-        answer = await sfu.handle_offer(sid, signal_data.get('sdp'), signal_data.get('type'))
+        SFU_SESSIONS[sid] = channel_id
 
-        log.info(f'call:signal sending answer to {sid}')
-        await sio.emit(
-            'channel:call:answer',
-            {'channel_id': channel_id, 'data': {'sdp': answer.sdp, 'type': answer.type}},
-            to=sid,
-        )
+        if WEBSOCKET_MANAGER == 'redis':
+            registry_entry = SFU_REGISTRY.get(channel_id)
+
+            # if the SFU is occuring on another instance, forward this event to that instance
+            # all WebRTC negotiations will use the IP and ports for that instance
+            if registry_entry and registry_entry['instance_id'] != INSTANCE_ID:
+                sfu_instance_id = registry_entry['instance_id']
+                relay_channel = f'{REDIS_KEY_PREFIX}:sfu:relay:{sfu_instance_id}'
+                await REDIS.publish(relay_channel, json.dumps({'event': 'offer', 'sid': sid, 'data': data}))
+
+                return
+
+            # SFU does not exist yet; claim the call for this instance
+            if not registry_entry:
+                SFU_REGISTRY[channel_id] = {'instance_id': INSTANCE_ID, 'created_at': int(time.time())}
+            else:
+                # entry exists and is for this instance; process locally
+                pass
+
+        await channel_call_sfu_handle_offer(sid, data)
     except Exception as e:
-        log.error(f'call:error in call_offer from {sid}: {e}', exc_info=True)
+        log.error(f'call: error handling offer from {sid}: {e}', exc_info=True)
 
 
 @sio.on('channel:call:leave')
@@ -556,27 +663,34 @@ async def channel_call_peer_leave(sid, data):
             return
 
         channel_id = data['channel_id']
-        sfu = SFU_POOL.get(channel_id)
-        if not sfu:
+
+        # check if user is in a different call
+        existing_channel_id = SFU_SESSIONS.get(sid)
+        if existing_channel_id and existing_channel_id != channel_id:
             return
 
-        log.info(f'call:signal {sid} leaving channel {channel_id}')
-        await sfu.remove_peer(sid)
+        # close the session
+        del SFU_SESSIONS[sid]
 
-        # notify remaining peers
-        for peer_sid in list(sfu.peers.keys()):
-            await sio.emit(
-                'channel:call:peer-left',
-                {'channel_id': channel_id, 'data': {'peer_id': sid}},
-                to=peer_sid,
-            )
+        if WEBSOCKET_MANAGER == 'redis':
+            registry_entry = SFU_REGISTRY.get(channel_id)
 
-        # clean up empty SFU
-        if sfu.is_empty():
-            log.info(f'call:sfu removing empty SFU for channel {channel_id}')
-            del SFU_POOL[channel_id]
+            if registry_entry and registry_entry['instance_id'] != INSTANCE_ID:
+                sfu_instance_id = registry_entry['instance_id']
+                relay_channel = f'{REDIS_KEY_PREFIX}:sfu:relay:{sfu_instance_id}'
+                await REDIS.publish(relay_channel, json.dumps({'event': 'leave', 'sid': sid, 'data': data}))
+
+                return
+
+            if not registry_entry:
+                SFU_REGISTRY[channel_id] = {'instance_id': INSTANCE_ID, 'created_at': int(time.time())}
+            else:
+                # entry exists and is for this instance; process locally
+                pass
+
+        await channel_call_sfu_handle_leave(sid, data)
     except Exception as e:
-        log.error(f'call:error in call_leave from {sid}: {e}', exc_info=True)
+        log.error(f'call: error on leave from {sid}: {e}', exc_info=True)
 
 
 def normalize_document_id(document_id: str) -> str:
@@ -868,23 +982,22 @@ async def disconnect(sid):
         # print(f"Unknown session ID {sid} disconnected")
 
     # clean up any SFU connections for this session
-    for channel_id in list(SFU_POOL.keys()):
-        # TODO refine this with [redis] cache of what channel the user is in
-        sfu = SFU_POOL.get(channel_id)
-        if sfu and (sid in sfu.peers):
-            log.info(f'call:disconnect removing {sid} from SFU {channel_id}')
-            await sfu.remove_peer(sid)
+    channel_id = SFU_SESSIONS.get(sid)
+    if channel_id:
+        data = {'channel_id': channel_id}
 
-            for peer_sid in list(sfu.peers.keys()):
-                await sio.emit(
-                    'channel:call:peer-left',
-                    {'channel_id': channel_id, 'data': {'peer_id': sid}},
-                    to=peer_sid,
-                )
+        if WEBSOCKET_MANAGER == 'redis':
+            registry_entry = SFU_REGISTRY.get(channel_id)
 
-            if sfu.is_empty():
-                log.info(f'call:disconnect removing empty SFU for channel {channel_id}')
-                del SFU_POOL[channel_id]
+            # forward leave event to hosting instance
+            if registry_entry and registry_entry['instance_id'] != INSTANCE_ID:
+                sfu_instance_id = registry_entry['instance_id']
+                relay_channel = f'{REDIS_KEY_PREFIX}:sfu:relay:{sfu_instance_id}'
+                await REDIS.publish(relay_channel, json.dumps({'event': 'leave', 'sid': sid, 'data': data}))
+
+                return
+
+        await channel_call_sfu_handle_leave(sid, data)
 
 
 def get_event_emitter(request_info, update_db=True):
